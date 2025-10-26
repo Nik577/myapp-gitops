@@ -1,0 +1,122 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+# azure-pipelines.yml
+trigger:
+  - main
+
+variables:
+  imageName: myapp
+  k8sNamespace: myapp
+  k8sManifestsPath: k8s/            # путь к твоим манифестам
+  gitRepo: $(Build.Repository.Name)
+
+stages:
+- stage: BuildAndPush
+  displayName: Build & Push images
+  jobs:
+  - job: Build
+    displayName: Build image and push to registries
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+
+    - checkout: self
+      persistCredentials: true
+
+    - script: |
+        echo "Commit: $(Build.SourceVersion)"
+        echo "BuildId: $(Build.BuildId)"
+      displayName: 'info'
+
+    # Собираем образ
+    - task: Docker@2
+      displayName: Build image
+      inputs:
+        command: build
+        Dockerfile: Dockerfile
+        tags: |
+          $(Build.BuildId)
+        repository: $(imageName)
+
+    # Тегуем образ для registry.gitlab.com и для локального registry
+    - script: |
+        IMAGE_LOCAL=localhost:5000/$(imageName):$(Build.BuildId)
+        IMAGE_GITLAB=registry.gitlab.com/$(Build.Repository.Name)/$(imageName):$(Build.BuildId)
+        docker tag $(imageName):$(Build.BuildId) $IMAGE_LOCAL
+        docker tag $(imageName):$(Build.BuildId) $IMAGE_GITLAB
+        echo "Tagged: $IMAGE_LOCAL and $IMAGE_GITLAB"
+      displayName: 'tag images'
+
+    # Login to local registry (если нужно) — используй секреты через переменные Azure DevOps
+    - script: |
+        echo "$(LOCAL_REGISTRY_PASSWORD)" | docker login localhost:5000 --username $(LOCAL_REGISTRY_USERNAME) --password-stdin || true
+      displayName: 'login to local registry (optional)'
+      env:
+        LOCAL_REGISTRY_PASSWORD: $(localRegistryPassword)    # secure pipeline variable
+        LOCAL_REGISTRY_USERNAME: $(localRegistryUser)
+
+    # Push to local registry
+    - script: |
+        docker push localhost:5000/$(imageName):$(Build.BuildId)
+      displayName: 'push to local registry'
+
+    # Login to GitLab registry
+    - script: |
+        echo "$(GITLAB_REGISTRY_TOKEN)" | docker login registry.gitlab.com --username $(GITLAB_REGISTRY_USER) --password-stdin
+      displayName: 'login to registry.gitlab.com'
+      env:
+        GITLAB_REGISTRY_TOKEN: $(gitlabRegistryToken)   # secure pipeline variable
+        GITLAB_REGISTRY_USER: $(gitlabRegistryUser)
+
+    # Push to GitLab registry
+    - script: |
+        docker push registry.gitlab.com/$(Build.Repository.Name)/$(imageName):$(Build.BuildId)
+      displayName: 'push to gitlab registry'
+
+    # Save the full image name into a pipeline variable for next stage
+    - script: |
+        echo "##vso[task.setvariable variable=IMAGE_FULL_NAME]registry.gitlab.com/$(Build.Repository.Name)/$(imageName):$(Build.BuildId)"
+      displayName: 'set IMAGE_FULL_NAME variable'
+
+- stage: Deploy
+  displayName: Deploy to Kubernetes
+  dependsOn: BuildAndPush
+  jobs:
+  - job: Deploy
+    displayName: Deploy to k8s using kubeconfig secure file
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - download: current
+      artifact: drop
+
+    # Скачиваем kubeconfig (загруженный как secure file в Azure DevOps)
+    - task: DownloadSecureFile@1
+      name: GetKubeconfig
+      inputs:
+        secureFile: 'kubeconfig'   # имя secure file, которое ты загрузишь в Azure DevOps
+
+    - script: |
+        # поместим kubeconfig в рабочую папку и выставим переменную KUBECONFIG
+        KUBECONFIG_PATH=$(Agent.TempDirectory)/kubeconfig_$(Build.BuildId)
+        cp "$(GetKubeconfig.secureFilePath)" "$KUBECONFIG_PATH"
+        chmod 600 "$KUBECONFIG_PATH"
+        export KUBECONFIG="$KUBECONFIG_PATH"
+        echo "KUBECONFIG set -> $KUBECONFIG"
+
+        # Проверим контекст и нод
+        kubectl config view --minify
+        kubectl get nodes -o wide
+
+        # Обновим image в деплойменте (если у тебя deployment называется myapp-deployment и контейнер называется myapp)
+        kubectl -n $(k8sNamespace) set image deployment/myapp-deployment myapp=$(IMAGE_FULL_NAME) --record || true
+
+        # Если у тебя манифесты, применим их (подставляем значение образа через envsubst если нужно)
+        # Можно подправить манифесты заранее, чтобы они использовали image: {{IMAGE_FULL_NAME}}
+        envsubst < $(Build.SourcesDirectory)/$(k8sManifestsPath)/deployment.yaml | kubectl -n $(k8sNamespace) apply -f -
+      displayName: 'kubectl apply / set image'
+      env:
+        IMAGE_FULL_NAME: $(IMAGE_FULL_NAME)
